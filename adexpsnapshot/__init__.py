@@ -27,7 +27,7 @@ from enum import Enum
 from typing import List
 
 class ADExplorerSnapshot(object):
-    OutputMode = Enum('OutputMode', ['BloodHound', 'Objects'])
+    OutputMode = Enum('OutputMode', ['BloodHound', 'Objects', 'LDIF'])
 
     def __init__(self, snapfile, outputfolder, log=None, snapshot_parser=None):
         self.log = log
@@ -102,6 +102,161 @@ class ADExplorerSnapshot(object):
             fh_out.close()
             result_q.task_done()
             
+        wq = queue.Queue()
+        results_worker = threading.Thread(target=write_worker, args=(wq, os.path.join(self.output, outputfile)))
+        results_worker.daemon = True
+        results_worker.start()
+
+        if self.log:
+            prog = self.log.progress("Collecting data", rate=0.1)
+
+        for idx, obj in enumerate(self.snap.objects):
+            wq.put((dict(obj.attributes.data)))
+
+            if self.log and self.log.term_mode:
+                prog.status(f"dumped {idx+1}/{self.snap.header.numObjects} objects")
+
+        if self.log:
+            prog.success(f"dumped {self.snap.header.numObjects} objects")
+
+        wq.put(None)
+        wq.join()
+
+        if self.log:
+            self.log.success(f"Output written to {outputfile}")
+
+    def outputLDIF(self):
+
+        import codecs, base64, datetime
+
+        outputfile = f"{self.snap.header.server}_{self.snap.header.filetimeUnix}_objects.ldif"
+
+        # RFC2849: The LDAP Data Interchange Format (LDIF)
+        class LDIFEncoder:
+
+            timestamp_attributes = ['whenCreated', 'whenChanged', 'dSCorePropagationData' ]
+
+            line_len = 78
+
+            def encode(self, obj):
+                if not isinstance(obj, dict):
+                    raise Exception(f"LDIFEncoder expects a dict")
+
+                lines = []
+                dn = obj.get("distinguishedName")
+                if not dn:
+                    logging.warning("Object without distinguishedName encountered")
+                else:
+                    if isinstance(dn, list):
+                        if len(dn) != 1:
+                            logging.warning("Object multi-valued distinguishedName encountered")
+                        else:
+                            dn = dn[0]
+                    lines.append(self.encode_attr("dn", dn))
+
+                for key in sorted(obj.keys()):
+                    value = obj[key]
+                    if isinstance(value, list):
+                        for item in value:
+                            lines.append(self.encode_attr(key, item))
+                    else:
+                        lines.append(self.encode_attr(key, value))
+
+                if len(lines):
+                    lines.append("")
+                return "\n".join(lines)
+
+            def encode_attr(self, name, value):
+                if name in LDIFEncoder.timestamp_attributes:
+                    encoded, base64 = self.encode_timestamp(value)
+                else:
+                    encoded, base64 = self.encode_primitive(value)
+
+                separator = "::" if base64 else ":"
+                attr = f"{name}{separator} {encoded}"
+
+                if len(attr) < LDIFEncoder.line_len:
+                    return attr
+
+                # fold lines by starting the continuation with a space
+                lines = [attr[:LDIFEncoder.line_len]]
+                for i in range(LDIFEncoder.line_len, len(attr), LDIFEncoder.line_len-1):
+                    lines.append(attr[i:i+LDIFEncoder.line_len-1])
+                return "\n ".join(lines)
+
+            def safe_string(self, value):
+                b = ord(value[0])
+                # SAFE-INIT-CHAR: any value <= 127 except NUL, LF, CR, SPACE, colon and less-than
+                if b > 127 or b in [0, 10, 13, 32, 58, 60]:
+                    return False
+
+                # SAFE-CHAR: any value <= 127 decimal except NUL, LF and CR
+                if any(ord(c) > 127 or ord(c) in [0, 10, 13] for c in value):
+                    return False;
+
+                # note 8) Values or distinguished names that end with SPACE SHOULD be base-64 encoded.
+                if value[-1] == ' ':
+                    return False
+
+                return True
+
+            def encode_primitive(self, obj):
+                if obj is None:
+                    return "", False
+                elif isinstance(obj, bool):
+                    return "TRUE" if obj else "FALSE", False
+                elif isinstance(obj, int):
+                    return str(obj if obj < 0x80000000 else obj - 0x100000000), False
+                elif isinstance(obj, float):
+                    return str(obj), False
+                elif isinstance(obj, bytes):
+                    return base64.b64encode(obj).decode("ascii"), True
+                elif isinstance(obj, str):
+                    if self.safe_string(obj):
+                        return obj, False
+                    return base64.b64encode(obj.encode("utf-8")).decode("ascii"), True
+                else:
+                    raise Exception(f"LDIFEncoder does not support objects of type {type(obj)}: {obj}")
+
+            def encode_timestamp(self, value):
+                try:
+                    return datetime.datetime.fromtimestamp(value, datetime.UTC).strftime('%Y%m%d%H%M%S.0Z'), False
+                except:
+                    logging.warning(f"Failed to parse timestamp {value}")
+                    return "0", False
+
+        ldif_encoder = LDIFEncoder()
+
+        def write_worker(result_q, filename):
+            try:
+                fh_out = codecs.open(filename, 'w', 'utf-8')
+            except:
+                logging.warning('Could not write file: %s', filename)
+                result_q.task_done()
+                return
+
+            wroteOnce = False
+            while True:
+                data = result_q.get()
+
+                if data is None:
+                    break
+
+                if not wroteOnce:
+                    wroteOnce = True
+                else:
+                    fh_out.write('\n')
+
+                try:
+                    encoded_member = ldif_encoder.encode(data)
+                    fh_out.write(encoded_member)
+                except TypeError:
+                    logging.error('Data error {0}, could not convert data to LDIF'.format(repr(data)))
+                result_q.task_done()
+
+            fh_out.close()
+            result_q.task_done()
+
         wq = queue.Queue()
         results_worker = threading.Thread(target=write_worker, args=(wq, os.path.join(self.output, outputfile)))
         results_worker.daemon = True
@@ -1155,6 +1310,8 @@ def main():
         ades.outputBloodHound()
     if outputmode == ADExplorerSnapshot.OutputMode.Objects:
         ades.outputObjects()
+    if outputmode == ADExplorerSnapshot.OutputMode.LDIF:
+        ades.outputLDIF()
 
 if __name__ == '__main__':
     main()
